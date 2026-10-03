@@ -226,26 +226,44 @@ def page_file_gb():
 
 
 def cpu_info():
-    """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
-    the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
-    name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
+    """(name, avx2, avx512, avx): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
+    the same test the engine makes (cpu_avx512_ok), not just AVX-512F. avx is the Ivy Bridge tier
+    (SSE4.2 + AVX + F16C, no AVX2: the engine's q2_ivb kernels, e.g. Xeon E5-2697 v2)."""
+    name, avx2, avx512, avx = platform.processor() or "unknown CPU", False, False, False
     if WIN:
         pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
         avx2 = bool(pf(40)) or _cpuid_avx2()      # PF_AVX2_INSTRUCTIONS_AVAILABLE, else the CPU itself (#159)
         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
         name = n or name
         avx512 = bool(pf(41)) and _cpuid_avx512_full()
+        avx = avx2 or _cpuid_ivb()
     else:
         try:
             txt = open("/proc/cpuinfo").read()
             flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
             avx2 = "avx2" in flags
             avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
+            avx = avx2 or {"ssse3", "sse4_2", "avx", "f16c"} <= flags
             m = re.search(r"^model name\s*:\s*(.*)$", txt, re.M)
             name = m.group(1) if m else name
         except OSError:
             pass
-    return name, avx2, avx512
+    return name, avx2, avx512, avx
+
+
+def _cpuid_ivb() -> bool:
+    """The Ivy Bridge tier (SSE4.2 + AVX + F16C, e.g. Xeon E5-2697 v2): CPUID leaf 1 ECX bits.
+    The q2_ivb kernels themselves need only SSSE3, but the tier is named for the CPU."""
+    try:
+        regs = (ctypes.c_uint32 * 4)()
+        _run_stub(bytes([0x53, 0x49, 0x89, 0xC8, 0x89, 0xD0, 0x31, 0xC9, 0x0F, 0xA2,      # push rbx; r8=rcx; eax=edx; ecx=0; cpuid
+                         0x41, 0x89, 0x00, 0x41, 0x89, 0x58, 0x04, 0x41, 0x89, 0x48, 0x08,  # [r8]=eax, [r8+4]=ebx, [r8+8]=ecx
+                         0x41, 0x89, 0x50, 0x0C, 0x5B, 0xC3]),                             # [r8+12]=edx; pop rbx
+                  ctypes.addressof(regs), 1)
+        ecx = regs[2]
+        return bool(((ecx >> 9) & 1) and ((ecx >> 20) & 1) and ((ecx >> 28) & 1) and ((ecx >> 29) & 1))
+    except Exception:
+        return False
 
 
 def _cpuid_avx512_full() -> bool:
@@ -1901,7 +1919,7 @@ def main() -> int:
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
-    cpu, avx2, avx512 = cpu_info()
+    cpu, avx2, avx512, avx = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values())
     low_ok = low_ram_fits("IQ1_M", ram, gpu["vram_gb"]) and a.low_ram != "off"   # the smallest model, mapped
     if ram < need - 4 and not a.check and not low_ok:
@@ -1917,9 +1935,14 @@ def main() -> int:
         warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
              "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
              "Advanced system settings > Performance > Advanced > Virtual memory")
-    ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
+    ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'SSE4/AVX (Ivy Bridge tier)' if avx else 'no AVX'})")
     if not avx2:
-        fail("this CPU has no AVX2; Strata needs at least AVX2")
+        if avx:
+            warn("this CPU has no AVX2 (Ivy Bridge tier, e.g. Xeon E5 v2): the Q2_0 CPU experts run on the "
+                 "SSE4/AVX kernels at ~3-4 GB/s per core, and i-quant experts on ggml-cpu. Q2_0 is recommended; "
+                 "a discrete GPU still carries the hot experts")
+        else:
+            fail("this CPU has neither AVX2 nor SSE4.2+AVX+F16C; Strata needs at least the Ivy Bridge tier")
     if a.check:
         say()
         for m, d in MODELS.items():

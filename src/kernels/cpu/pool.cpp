@@ -2,6 +2,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/q2_ivb.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -338,6 +339,9 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    // Ivy Bridge tier: the s2_*_vnni kernels are AVX-512 machine code and fault here;
+    // the ivb variants serve the same canonical blob. Cached once per drain (48x/token).
+    const bool ivb = cpu_use_ivb();
     for (;;) {
         const int ci = claim(epoch);
         if (ci < 0) break;
@@ -346,15 +350,18 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
-            s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
+            if (ivb) s2_expert_vnni_q_ivb(j.blob, *j.act, j.out, scratch);
+            else s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
         } else if (mode_ == 1) {
             const int e = (int) i / parts_a_, part = (int) i % parts_a_;
             const int r0 = FF * part / parts_a_, r1 = FF * (part + 1) / parts_a_;
-            s2_expert_gu_rows(jobs_[e].blob, *jobs_[e].act, split_[(size_t) e].ff, r0, r1);
+            if (ivb) s2_expert_gu_rows_ivb(jobs_[e].blob, *jobs_[e].act, split_[(size_t) e].ff, r0, r1);
+            else s2_expert_gu_rows(jobs_[e].blob, *jobs_[e].act, split_[(size_t) e].ff, r0, r1);
         } else if (mode_ == 2) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
-            s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+            if (ivb) s2_expert_down_rows_ivb(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+            else s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
@@ -403,11 +410,13 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 if (mode_ == 3) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    s2_expert_gu_rows_multi(mjobs_[e].blob, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
+                    if (ivb) s2_expert_gu_rows_multi_ivb(mjobs_[e].blob, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
+                    else s2_expert_gu_rows_multi(mjobs_[e].blob, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
                 } else {
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    s2_expert_down_rows_multi(mjobs_[e].blob, a2, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    if (ivb) s2_expert_down_rows_multi_ivb(mjobs_[e].blob, a2, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    else s2_expert_down_rows_multi(mjobs_[e].blob, a2, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
                 r += r1 - r0;
             }
@@ -438,7 +447,8 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     parts_a_ = (std::max)(1, (3 * threads + n - 1) / n);
     parts_b_ = parts_a_;
     run_phase(1, n * parts_a_);
-    for (int e = 0; e < n; ++e) act_quant_q8_1(split_[(size_t) e].ff, FF, split_[(size_t) e].a2);
+    // act_quant_any: the AVX-512 quantizer faults on the Ivy Bridge tier (see q2_ivb.hpp).
+    for (int e = 0; e < n; ++e) act_quant_any(split_[(size_t) e].ff, FF, split_[(size_t) e].a2);
     run_phase(2, n * parts_b_);
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -470,7 +480,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     const auto t1 = std::chrono::steady_clock::now();
     for (int e = 0; e < n; ++e)
         for (int t = 0; t < jobs[e].nt; ++t)
-            act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+            act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
     const auto t2 = std::chrono::steady_clock::now();
     mrows_ = (int64_t) n * H;
     run_phase(4, mtasks_);
@@ -517,7 +527,10 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
 void ExpertPool::run(ExpertJob* jobs, int n) {
     if (n <= 0) return;
     if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
-        for (int i = 0; i < n; ++i) s2_expert_vnni_q(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
+        if (cpu_use_ivb())
+            for (int i = 0; i < n; ++i) s2_expert_vnni_q_ivb(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
+        else
+            for (int i = 0; i < n; ++i) s2_expert_vnni_q(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
         return;
     }
     // Wait for every worker to be parked BEFORE touching the batch, so the publish below is the only thing
@@ -548,13 +561,15 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     // The host's `done_.fetch_add` is a release for the same reason a worker's is: `j.out` is read by the
     // device after `run()` returns, so the write must be published, not merely performed.
     if (host_works_) {
+        const bool ivb = cpu_use_ivb();
         for (;;) {
             const int ci = claim(e);
             if (ci < 0) break;
             hstate_.store(ci, std::memory_order_relaxed);
             hstate_ms_.store(now_ms(), std::memory_order_relaxed);
             const ExpertJob& j = jobs_[ci];
-            s2_expert_vnni_q(j.blob, *j.act, j.out, host_scratch_);
+            if (ivb) s2_expert_vnni_q_ivb(j.blob, *j.act, j.out, host_scratch_);
+            else s2_expert_vnni_q(j.blob, *j.act, j.out, host_scratch_);
             done_.fetch_add(1, std::memory_order_release);
         }
     }

@@ -53,22 +53,10 @@ inline __m256i sc16(int a, int b) {
 // One scale for the whole 32-value half (IQ2_XXS, IQ3_XXS, IQ3_S).
 inline __m256i sc32(int s) { return _mm256_set1_epi16(s); }
 
-// keven_signs_q2xs (ggml keeps it static in arch/x86/quants.c): one u64 per 7-bit sign index, byte k
-// = 0xFF when bit k of ksigns_iq2xs[i] is set, 0x01 otherwise.  With this a whole 32-value sign vector
-// is four scalar loads and a set_epi64x - no ksigns byte packing chain and no bit_selector expansion.
-// Built once at load time from the shared ggml-common table so it can never drift from it.
-struct EvenSigns {
-    uint64_t v[128];
-    EvenSigns() {
-        for (int i = 0; i < 128; ++i) {
-            uint64_t r = 0;
-            for (int k = 0; k < 8; ++k)
-                r |= (uint64_t) (((ksigns_iq2xs[i] >> k) & 1) ? 0xFF : 0x01) << (8 * k);
-            v[i] = r;
-        }
-    }
-};
-static const EvenSigns even_signs;
+// NOTE (Ivy Bridge tier): the keven_signs_q2xs table used to be built here by a file-scope
+// `static const` constructor. That constructor runs at CRT startup inside a TU compiled with
+// /arch:AVX2, which is a 0xc000001d before main() on CPUs without AVX2. It now lives in
+// iq_signs.cpp (baseline codegen, built on first use); see iq2xs_even_signs().
 
 inline float hsum8(__m256 v) {
     const __m128 lo = _mm256_castps256_ps128(v), hi = _mm256_extractf128_ps(v, 1);
@@ -106,8 +94,9 @@ template <> struct Fmt32<16> {   // IQ2_XXS: d, qs[32] u16
         const uint32_t w0 = u32(q), w1 = u32(q + 4);
         g = _mm256_set_epi64x((long long) iq2xxs_grid[w0 >> 24], (long long) iq2xxs_grid[(w0 >> 16) & 255],
                               (long long) iq2xxs_grid[(w0 >> 8) & 255], (long long) iq2xxs_grid[w0 & 255]);
-        sgn = _mm256_set_epi64x((long long) even_signs.v[(w1 >> 21) & 127], (long long) even_signs.v[(w1 >> 14) & 127],
-                                (long long) even_signs.v[(w1 >> 7) & 127], (long long) even_signs.v[w1 & 127]);
+        const uint64_t* ev = iq2xs_even_signs();
+        sgn = _mm256_set_epi64x((long long) ev[(w1 >> 21) & 127], (long long) ev[(w1 >> 14) & 127],
+                                (long long) ev[(w1 >> 7) & 127], (long long) ev[w1 & 127]);
         sc = sc32(2 * (int) (w1 >> 28) + 1);
     }
 };
@@ -155,8 +144,9 @@ template <> struct Fmt32<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 
         g = _mm256_set_epi32((int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
                              (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
         const uint32_t w = u32(b + 2 + 64 + 8 * j + 4 * half);
-        sgn = _mm256_set_epi64x((long long) even_signs.v[(w >> 21) & 127], (long long) even_signs.v[(w >> 14) & 127],
-                                (long long) even_signs.v[(w >> 7) & 127], (long long) even_signs.v[w & 127]);
+        const uint64_t* ev = iq2xs_even_signs();
+        sgn = _mm256_set_epi64x((long long) ev[(w >> 21) & 127], (long long) ev[(w >> 14) & 127],
+                                (long long) ev[(w >> 7) & 127], (long long) ev[w & 127]);
         sc = sc32(2 * (int) (w >> 28) + 1);
     }
 };

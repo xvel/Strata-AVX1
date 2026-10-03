@@ -653,10 +653,12 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/q2_ivb.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
+# The Ivy Bridge tier (q2_ivb.cpp) deliberately gets the SMALLEST flag: SSSE3 only, so it runs
+# on a Xeon E5-2697 v2 (and anything newer). `grep -c '_mm256_('` on it must print 0.
 if(MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
@@ -665,6 +667,7 @@ else()
   set_source_files_properties(src/kernels/cpu/expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/kernels/cpu/q2_ivb.cpp PROPERTIES COMPILE_OPTIONS "-mssse3")
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
@@ -711,9 +714,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
-  # one-pass static linking has no cycle to resolve)
+  # one-pass static linking has no cycle to resolve).
+  # iq_signs.cpp deliberately gets NO arch flags: it builds the keven_signs table on baseline codegen,
+  # so a file-scope constructor can never execute AVX2 at CRT startup (0xc000001d on pre-AVX2 CPUs).
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp)
+                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_signs.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -829,6 +834,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+
+  # Ivy Bridge tier (Xeon E5-2697 v2): parity + bench of the q2_ivb kernels. No AVX2/AVX-512
+  # kernel is referenced, so this is the test that runs ON that CPU (expert_parity and the
+  # pool tests cannot start there: their reference kernels are AVX-512 machine code).
+  add_executable(ivb_parity src/kernels/cpu/ivb_parity.cpp)
+  target_link_libraries(ivb_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME ivb_parity COMMAND ivb_parity)
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)

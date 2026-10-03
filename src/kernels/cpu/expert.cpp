@@ -4,6 +4,7 @@
 // (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
 // include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <immintrin.h>
 #if defined(_MSC_VER)
@@ -375,9 +376,21 @@ CpuFeatures cpu_features() {
 void cpu_require_expert_support() {
     const CpuFeatures f = cpu_features();
     if (f.usable()) return;
+    // Ivy Bridge tier (Xeon E5-2697 v2): no AVX-512, but the q2_ivb kernels (SSE4/AVX)
+    // serve the same blobs. Warn once about the slower CPU-expert term instead of refusing.
+    if (cpu_use_ivb()) {
+        std::fprintf(stderr,
+                     "strata: no AVX-512 found: the Q2_0 CPU experts run on the SSE4/AVX tier "
+                     "(Ivy Bridge and newer).\n"
+                     "        Expect a slower CPU-expert term than the AVX2/AVX-512 figures in docs/DETAILS.md; "
+                     "a discrete GPU still carries the hot experts.\n");
+        return;
+    }
     std::fprintf(stderr,
                  "strata: this CPU cannot run the expert kernel: %s.\n"
-                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
+                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer),\n"
+                 "        AVX2 + FMA + F16C (Haswell / Zen 2 or newer), or at least SSE4.2 + AVX + F16C\n"
+                 "        (Ivy Bridge or newer, SSE4/AVX tier).\n"
                  "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
                  f.reason());
     std::exit(1);

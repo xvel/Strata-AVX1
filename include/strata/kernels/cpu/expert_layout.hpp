@@ -41,6 +41,15 @@ struct ExpertLayout {
 /// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
 /// file compiled without AVX-512, so asking is safe everywhere; STRATA_FORCE_AVX2=1 answers no (for tests).
 bool cpu_avx512_ok();
+/// Whether this CPU runs the AVX2 kernels (AVX2 + FMA + F16C with OS YMM state).
+/// Probed the same way; STRATA_FORCE_IVB=1 answers no (for Ivy Bridge tier tests).
+bool cpu_avx2_ok();
+/// Whether this CPU runs the Ivy Bridge tier kernels (SSE4.2 + AVX + F16C: no AVX2, no FMA;
+/// the q2_ivb TU itself needs only SSSE3). Xeon E5-2697 v2 answers yes.
+bool cpu_ivb_ok();
+/// True when the engine must use the q2_ivb kernels: an Ivy Bridge tier CPU, or
+/// STRATA_FORCE_IVB=1 on a newer one (tests). Checked before cpu_avx512_ok/cpu_avx2_ok.
+bool cpu_use_ivb();
 /// Q2_0 GGUF rows / activation quantizer on the kernels this CPU has.
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1);

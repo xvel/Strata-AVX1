@@ -83,7 +83,9 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
+    // The AVX2 multi-token kernels fault below AVX2 (Ivy Bridge tier): check the hardware,
+    // not just the env knob, so ggml-cpu's vec_dot (with its own SSE paths) is used there.
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
     // can depend on how many drafts a verify window held.  STRATA_IQ_MT_MIN=1 (opt-in, 0.1.30) uses the multi-token
@@ -117,7 +119,8 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
-    static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
+    // cpu_avx2_ok: the kernel TU is /arch:AVX2 and faults on the Ivy Bridge tier.
+    static const bool iq4nl_mt = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ4NL") == nullptr;
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);

@@ -10,6 +10,12 @@
 
 namespace strata::kernels::cpu {
 
+/// 128-entry sign-expansion table for IQ2_XXS/IQ3_XXS (byte k of entry i = 0xFF when bit k
+/// of ksigns_iq2xs[i] is set, else 0x01). Built on first use in iq_signs.cpp - a TU compiled
+/// WITHOUT /arch flags - so pre-AVX2 CPUs never execute AVX2 code at CRT startup
+/// (a file-scope constructor in an /arch:AVX2 TU dies with 0xc000001d before main()).
+const uint64_t* iq2xs_even_signs();
+
 bool iq256_supported(int ggml_type) noexcept;
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,

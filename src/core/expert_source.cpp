@@ -874,7 +874,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
     // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
     // so anything cached against it would be layer 0's activation reused 48 times.
-    act_quant_q8_1(x_f, H, d.act);
+    act_quant_any(x_f, H, d.act);  // ivb tier: the AVX-512 quantizer faults on pre-AVX2 CPUs
 
     // ---- R4.2c: THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
     //
@@ -1115,7 +1115,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t t = 0; t < n_tok; ++t)
             native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
     else
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);  // ivb tier
     const auto c2 = std::chrono::steady_clock::now();
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)

@@ -1,5 +1,6 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/q2_ivb.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -51,13 +52,95 @@ bool cpu_avx512_ok() {
     return ok;
 }
 
+namespace {
+// CPUID leaf 1 snapshot shared by the AVX2 / Ivy Bridge probes below.
+void cpuid_leaf1(unsigned& eax, unsigned& ebx, unsigned& ecx, unsigned& edx) {
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuid(x, 1);
+    eax = (unsigned) x[0];
+    ebx = (unsigned) x[1];
+    ecx = (unsigned) x[2];
+    edx = (unsigned) x[3];
+#else
+    __cpuid_count(1, 0, eax, ebx, ecx, edx);
+#endif
+    (void) eax;
+    (void) ebx;
+    (void) edx;
+}
+
+bool xcr0_ymm_ok() {
+#if defined(_MSC_VER)
+    const unsigned long long xcr0 = _xgetbv(0);
+#else
+    unsigned lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+    return (xcr0 & 0x6u) == 0x6u;   // XMM + YMM state saved by the OS
+}
+}  // namespace
+
+bool cpu_avx2_ok() {
+    static const bool ok = [] {
+        if (const char* f = std::getenv("STRATA_FORCE_IVB"); f != nullptr && f[0] == '1') return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+            __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+        };
+        cpuid(0, 0);
+        if (r[0] < 7) return false;
+        unsigned eax, ebx, ecx, edx;
+        cpuid_leaf1(eax, ebx, ecx, edx);
+        if (!((ecx >> 27) & 1u) || !((ecx >> 28) & 1u)) return false;   // OSXSAVE + AVX
+        if (!xcr0_ymm_ok()) return false;
+        cpuid(7, 0);
+        if (!((r[1] >> 5) & 1u)) return false;                          // AVX2
+        if (!((ecx >> 29) & 1u)) return false;                          // F16C
+        // FMA is leaf 1 ECX bit 12; the AVX2 kernels use _mm256_fmadd_ps.
+        return ((ecx >> 12) & 1u) != 0;
+    }();
+    return ok;
+}
+
+bool cpu_ivb_ok() {
+    static const bool ok = [] {
+        unsigned eax, ebx, ecx, edx;
+        cpuid_leaf1(eax, ebx, ecx, edx);
+        // SSE4.2 (20) + OSXSAVE/AVX for the name; the q2_ivb TU itself needs only SSSE3 (ECX 9).
+        // XCR0 is NOT required: no YMM instruction appears in that TU.
+        return ((ecx >> 9) & 1u) && ((ecx >> 20) & 1u) && ((ecx >> 28) & 1u) && ((ecx >> 29) & 1u);
+    }();
+    return ok;
+}
+
+bool cpu_use_ivb() {
+    if (const char* f = std::getenv("STRATA_FORCE_IVB"); f != nullptr && f[0] == '1') return true;
+    return cpu_ivb_ok() && !cpu_avx2_ok() && !cpu_avx512_ok();
+}
+
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
+    if (cpu_use_ivb()) {
+        q2_0_gguf_rows_multi_ivb(w, row_bytes, nblocks, a, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void act_quant_any(const float* x, int n, ActQ& a) {
+    if (cpu_use_ivb()) {
+        act_quant_q8_1_ivb(x, n, a);
+        return;
+    }
     if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
     else act_quant_q8_1_avx2(x, n, a);
 }
